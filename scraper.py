@@ -58,6 +58,14 @@ def fetch_html_via_proxy(target_url: str) -> str:
             html = resp.text
             if len(html) > 5000:
                 return html
+            mode = "render" if render_js else "raw"
+            parsed = BeautifulSoup(html, "html.parser")
+            title = (parsed.title.string.strip() if parsed.title and parsed.title.string else "NO_TITLE")
+            snippet = re.sub(r"\s+", " ", parsed.get_text(" ", strip=True))[:180]
+            print(
+                f"[DEBUG] Short proxy response ({mode}) for {target_url}: "
+                f"len={len(html)} title='{title}' snippet='{snippet}'"
+            )
         except requests.RequestException as e:
             mode = "render" if render_js else "raw"
             print(f"[WARN] Proxy fetch failed ({mode}) for {target_url}: {e}")
@@ -78,6 +86,9 @@ def fetch_events(city: str) -> list[dict]:
 
     # Bandsintown event links follow pattern: /e/{id}-{artist}-at-{venue}
     event_links = soup.find_all("a", href=re.compile(r"/e/\d+-"))
+    if not event_links:
+        title = (soup.title.string.strip() if soup.title and soup.title.string else "NO_TITLE")
+        print(f"[DEBUG] No event links found for {url}. page_title='{title}'")
 
     seen_ids = set()
     for link in event_links:
