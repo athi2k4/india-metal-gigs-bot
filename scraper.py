@@ -1,9 +1,9 @@
 import json
 import os
 import re
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone
 
 # --- Configuration ---
 
@@ -19,29 +19,33 @@ CITIES = [
     "kolkata-india",
 ]
 
-GENRES = ["metal", "rock", "punk", "hardcore"]
+# We fetch ALL events per city, no genre filter (Bandsintown blocks genre URLs)
+# Instead we post everything — the Indian live music scene is small enough
+# that most listed events are relevant to the community
 
 POSTED_EVENTS_FILE = "posted_events.json"
 
 # --- Scraping ---
 
+# Create a cloudscraper session (bypasses Cloudflare)
+scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "mobile": False}
+)
 
-def build_url(city: str, genre: str) -> str:
-    """Build Bandsintown city page URL with genre filter."""
-    return f"https://www.bandsintown.com/c/{city}/all-dates/genre/{genre}"
+
+def build_url(city: str) -> str:
+    """Build Bandsintown city page URL (all genres)."""
+    return f"https://www.bandsintown.com/c/{city}"
 
 
-def fetch_events(city: str, genre: str) -> list[dict]:
-    """Scrape events from a single city+genre page."""
-    url = build_url(city, genre)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+def fetch_events(city: str) -> list[dict]:
+    """Scrape events from a city page."""
+    url = build_url(city)
 
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        resp = scraper.get(url, timeout=30)
         resp.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         print(f"[WARN] Failed to fetch {url}: {e}")
         return []
 
@@ -110,7 +114,6 @@ def fetch_events(city: str, genre: str) -> list[dict]:
                 "venue": venue,
                 "date": date_str,
                 "city": city.split("-")[0].title(),
-                "genre": genre,
                 "url": event_url,
                 "image": image_url,
             }
@@ -134,7 +137,7 @@ def load_posted_events() -> set:
 def save_posted_events(posted_ids: set):
     """Save posted event IDs to JSON file."""
     with open(POSTED_EVENTS_FILE, "w") as f:
-        json.dump({"posted_ids": sorted(posted_ids), "last_run": datetime.utcnow().isoformat()}, f, indent=2)
+        json.dump({"posted_ids": sorted(posted_ids), "last_run": datetime.now(timezone.utc).isoformat()}, f, indent=2)
 
 
 # --- Discord ---
@@ -160,7 +163,6 @@ def post_to_discord(events: list[dict]):
                     {"name": "📍 Venue", "value": event["venue"], "inline": True},
                     {"name": "🏙️ City", "value": event["city"], "inline": True},
                     {"name": "📅 Date", "value": event["date"] or "TBA", "inline": True},
-                    {"name": "🎵 Genre", "value": event["genre"].title(), "inline": True},
                 ],
                 "footer": {"text": "via Bandsintown"},
             }
@@ -176,10 +178,10 @@ def post_to_discord(events: list[dict]):
         }
 
         try:
-            resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+            resp = scraper.post(DISCORD_WEBHOOK, json=payload, timeout=15)
             resp.raise_for_status()
             print(f"[OK] Posted {len(batch)} events to Discord")
-        except requests.RequestException as e:
+        except Exception as e:
             print(f"[ERROR] Discord webhook failed: {e}")
 
 
@@ -187,19 +189,18 @@ def post_to_discord(events: list[dict]):
 
 
 def main():
-    print(f"=== India Metal Gigs Bot — {datetime.utcnow().isoformat()} ===")
+    print(f"=== India Metal Gigs Bot — {datetime.now(timezone.utc).isoformat()} ===")
 
     # Load already-posted event IDs
     posted_ids = load_posted_events()
     print(f"Previously posted: {len(posted_ids)} events")
 
-    # Scrape all city+genre combos
+    # Scrape all cities
     all_events = []
     for city in CITIES:
-        for genre in GENRES:
-            events = fetch_events(city, genre)
-            print(f"  {city}/{genre}: {len(events)} events found")
-            all_events.extend(events)
+        events = fetch_events(city)
+        print(f"  {city}: {len(events)} events found")
+        all_events.extend(events)
 
     # Deduplicate across city/genre combos (same event can appear multiple times)
     unique_events = {}
