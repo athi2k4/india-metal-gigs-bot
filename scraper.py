@@ -1,9 +1,10 @@
 import json
 import os
 import re
-import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from playwright.sync_api import sync_playwright
 
 # --- Configuration ---
 
@@ -27,29 +28,26 @@ POSTED_EVENTS_FILE = "posted_events.json"
 
 # --- Scraping ---
 
-# Create a cloudscraper session (bypasses Cloudflare)
-scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "mobile": False}
-)
-
 
 def build_url(city: str) -> str:
     """Build Bandsintown city page URL (all genres)."""
     return f"https://www.bandsintown.com/c/{city}"
 
 
-def fetch_events(city: str) -> list[dict]:
-    """Scrape events from a city page."""
+def fetch_events(city: str, page) -> list[dict]:
+    """Scrape events from a city page using Playwright browser."""
     url = build_url(city)
 
     try:
-        resp = scraper.get(url, timeout=30)
-        resp.raise_for_status()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        # Wait for event links to appear
+        page.wait_for_selector('a[href*="/e/"]', timeout=15000)
+        html = page.content()
     except Exception as e:
         print(f"[WARN] Failed to fetch {url}: {e}")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     events = []
 
     # Bandsintown event links follow pattern: /e/{id}-{artist}-at-{venue}
@@ -178,7 +176,7 @@ def post_to_discord(events: list[dict]):
         }
 
         try:
-            resp = scraper.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+            resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
             resp.raise_for_status()
             print(f"[OK] Posted {len(batch)} events to Discord")
         except Exception as e:
@@ -195,12 +193,19 @@ def main():
     posted_ids = load_posted_events()
     print(f"Previously posted: {len(posted_ids)} events")
 
-    # Scrape all cities
-    all_events = []
-    for city in CITIES:
-        events = fetch_events(city)
-        print(f"  {city}: {len(events)} events found")
-        all_events.extend(events)
+    # Launch headless browser
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
+        # Scrape all cities
+        all_events = []
+        for city in CITIES:
+            events = fetch_events(city, page)
+            print(f"  {city}: {len(events)} events found")
+            all_events.extend(events)
+
+        browser.close()
 
     # Deduplicate across city/genre combos (same event can appear multiple times)
     unique_events = {}
