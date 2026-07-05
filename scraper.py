@@ -1,14 +1,16 @@
 import json
 import os
 import re
+from urllib.parse import quote_plus
+
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
-from playwright.sync_api import sync_playwright
 
 # --- Configuration ---
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
 
 CITIES = [
     "bengaluru-india",
@@ -28,23 +30,47 @@ POSTED_EVENTS_FILE = "posted_events.json"
 
 # --- Scraping ---
 
+SCRAPER_API_BASE = "https://api.scraperapi.com"
+
 
 def build_url(city: str) -> str:
     """Build Bandsintown city page URL (all genres)."""
     return f"https://www.bandsintown.com/c/{city}"
 
 
-def fetch_events(city: str, page) -> list[dict]:
-    """Scrape events from a city page using Playwright browser."""
+def build_proxy_url(target_url: str, render_js: bool = False) -> str:
+    """Build ScraperAPI URL around target URL."""
+    encoded_target = quote_plus(target_url)
+    render_param = "&render=true" if render_js else ""
+    return (
+        f"{SCRAPER_API_BASE}?api_key={SCRAPER_API_KEY}&url={encoded_target}"
+        f"{render_param}&keep_headers=true&country_code=in"
+    )
+
+
+def fetch_html_via_proxy(target_url: str) -> str:
+    """Fetch HTML through proxy with a JS-render fallback."""
+    for render_js in (False, True):
+        proxy_url = build_proxy_url(target_url, render_js=render_js)
+        try:
+            resp = requests.get(proxy_url, timeout=60)
+            resp.raise_for_status()
+            html = resp.text
+            if len(html) > 5000:
+                return html
+        except requests.RequestException as e:
+            mode = "render" if render_js else "raw"
+            print(f"[WARN] Proxy fetch failed ({mode}) for {target_url}: {e}")
+    return ""
+
+
+def fetch_events(city: str) -> list[dict]:
+    """Scrape events from a city page through proxy."""
     url = build_url(city)
 
-    try:
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        # Wait for event links to appear
-        page.wait_for_selector('a[href*="/e/"]', timeout=15000)
-        html = page.content()
-    except Exception as e:
-        print(f"[WARN] Failed to fetch {url}: {e}")
+    html = fetch_html_via_proxy(url)
+    if not html:
+        print(f"[WARN] Failed to fetch {url}: empty response")
         return []
 
     soup = BeautifulSoup(html, "html.parser")
@@ -66,7 +92,6 @@ def fetch_events(city: str, page) -> list[dict]:
             continue
         seen_ids.add(event_id)
 
-        # Extract text content from the link
         text = link.get_text(separator=" | ", strip=True)
 
         # Try to find artist image near this link
@@ -102,7 +127,6 @@ def fetch_events(city: str, page) -> list[dict]:
         if date_match:
             date_str = date_match.group(0)
 
-        # Build clean event URL
         event_url = f"https://www.bandsintown.com/e/{event_id}"
 
         events.append(
@@ -189,23 +213,20 @@ def post_to_discord(events: list[dict]):
 def main():
     print(f"=== India Metal Gigs Bot — {datetime.now(timezone.utc).isoformat()} ===")
 
+    if not SCRAPER_API_KEY:
+        print("[ERROR] SCRAPER_API_KEY not set")
+        return
+
     # Load already-posted event IDs
     posted_ids = load_posted_events()
     print(f"Previously posted: {len(posted_ids)} events")
 
-    # Launch headless browser
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        # Scrape all cities
-        all_events = []
-        for city in CITIES:
-            events = fetch_events(city, page)
-            print(f"  {city}: {len(events)} events found")
-            all_events.extend(events)
-
-        browser.close()
+    # Scrape all cities
+    all_events = []
+    for city in CITIES:
+        events = fetch_events(city)
+        print(f"  {city}: {len(events)} events found")
+        all_events.extend(events)
 
     # Deduplicate across city/genre combos (same event can appear multiple times)
     unique_events = {}
