@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 
 DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY")
+DISCORD_ROLE_ID = "1515020429436260634"
 
 CITIES = [
     "bengaluru-india",
@@ -92,6 +93,35 @@ def parse_event_date(date_text: str) -> str:
     return ""
 
 
+def normalize_image_url(url: str) -> str:
+    """Normalize image URL for Discord embeds."""
+    if not url:
+        return ""
+    if url.startswith("//"):
+        return f"https:{url}"
+    return url
+
+
+def extract_image_url(img_tag) -> str:
+    """Extract image URL from multiple lazy-load attributes."""
+    if not img_tag:
+        return ""
+
+    for attr in ("src", "data-src", "data-lazy-src"):
+        value = (img_tag.get(attr) or "").strip()
+        if value:
+            return normalize_image_url(value)
+
+    for attr in ("srcset", "data-srcset"):
+        value = (img_tag.get(attr) or "").strip()
+        if value:
+            first = value.split(",")[0].strip().split(" ")[0]
+            if first:
+                return normalize_image_url(first)
+
+    return ""
+
+
 def fetch_events(city: str, genre: str) -> list[dict]:
     """Scrape events from a city+genre page through proxy."""
     url = build_url(city, genre)
@@ -129,8 +159,7 @@ def fetch_events(city: str, genre: str) -> list[dict]:
             parent = link.parent
             if parent:
                 img_tag = parent.find("img")
-        if img_tag:
-            image_url = img_tag.get("src", "") or img_tag.get("data-src", "")
+        image_url = extract_image_url(img_tag)
 
         slug_match = re.search(r"/e/\d+-(.+)", href.split("?")[0])
         if slug_match:
@@ -253,6 +282,7 @@ def post_to_discord(events: list[dict], mode: str):
             }
             if event.get("image"):
                 embed["thumbnail"] = {"url": event["image"]}
+                embed["image"] = {"url": event["image"]}
             embeds.append(embed)
 
         payload = {
@@ -260,6 +290,11 @@ def post_to_discord(events: list[dict], mode: str):
             "avatar_url": "https://i.imgur.com/4M34hi2.png",
             "embeds": embeds,
         }
+
+        # Mention configured role only when we actually send event data.
+        if DISCORD_ROLE_ID and i == 0:
+            payload["content"] = f"<@&{DISCORD_ROLE_ID}>"
+            payload["allowed_mentions"] = {"parse": [], "roles": [DISCORD_ROLE_ID]}
 
         try:
             resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=20)
