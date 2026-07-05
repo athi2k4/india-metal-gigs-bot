@@ -5,7 +5,7 @@ from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 # --- Configuration ---
 
@@ -22,9 +22,7 @@ CITIES = [
     "kolkata-india",
 ]
 
-# We fetch ALL events per city, no genre filter (Bandsintown blocks genre URLs)
-# Instead we post everything — the Indian live music scene is small enough
-# that most listed events are relevant to the community
+GENRES = ["metal", "rock", "punk", "alternative", "blues"]
 
 POSTED_EVENTS_FILE = "posted_events.json"
 
@@ -33,9 +31,9 @@ POSTED_EVENTS_FILE = "posted_events.json"
 SCRAPER_API_BASE = "https://api.scraperapi.com"
 
 
-def build_url(city: str) -> str:
-    """Build Bandsintown city page URL (all genres)."""
-    return f"https://www.bandsintown.com/c/{city}"
+def build_url(city: str, genre: str) -> str:
+    """Build Bandsintown city page URL with genre filter."""
+    return f"https://www.bandsintown.com/c/{city}/all-dates/genre/{genre}"
 
 
 def build_proxy_url(target_url: str, render_js: bool = False) -> str:
@@ -60,7 +58,7 @@ def fetch_html_via_proxy(target_url: str) -> str:
                 return html
             mode = "render" if render_js else "raw"
             parsed = BeautifulSoup(html, "html.parser")
-            title = (parsed.title.string.strip() if parsed.title and parsed.title.string else "NO_TITLE")
+            title = parsed.title.string.strip() if parsed.title and parsed.title.string else "NO_TITLE"
             snippet = re.sub(r"\s+", " ", parsed.get_text(" ", strip=True))[:180]
             print(
                 f"[DEBUG] Short proxy response ({mode}) for {target_url}: "
@@ -72,9 +70,31 @@ def fetch_html_via_proxy(target_url: str) -> str:
     return ""
 
 
-def fetch_events(city: str) -> list[dict]:
-    """Scrape events from a city page through proxy."""
-    url = build_url(city)
+def parse_event_date(date_text: str) -> str:
+    """Parse date text into YYYY-MM-DD when possible."""
+    if not date_text:
+        return ""
+
+    now = datetime.now(timezone.utc).date()
+    date_text = date_text.strip()
+
+    for fmt in ("%b %d, %Y", "%b %d"):
+        try:
+            parsed = datetime.strptime(date_text, fmt)
+            if fmt == "%b %d":
+                parsed = parsed.replace(year=now.year)
+                if parsed.date() < now - timedelta(days=30):
+                    parsed = parsed.replace(year=now.year + 1)
+            return parsed.date().isoformat()
+        except ValueError:
+            continue
+
+    return ""
+
+
+def fetch_events(city: str, genre: str) -> list[dict]:
+    """Scrape events from a city+genre page through proxy."""
+    url = build_url(city, genre)
 
     html = fetch_html_via_proxy(url)
     if not html:
@@ -84,16 +104,14 @@ def fetch_events(city: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     events = []
 
-    # Bandsintown event links follow pattern: /e/{id}-{artist}-at-{venue}
     event_links = soup.find_all("a", href=re.compile(r"/e/\d+-"))
     if not event_links:
-        title = (soup.title.string.strip() if soup.title and soup.title.string else "NO_TITLE")
+        title = soup.title.string.strip() if soup.title and soup.title.string else "NO_TITLE"
         print(f"[DEBUG] No event links found for {url}. page_title='{title}'")
 
     seen_ids = set()
     for link in event_links:
         href = link.get("href", "")
-        # Extract event ID from URL
         match = re.search(r"/e/(\d+)-", href)
         if not match:
             continue
@@ -105,23 +123,18 @@ def fetch_events(city: str) -> list[dict]:
 
         text = link.get_text(separator=" | ", strip=True)
 
-        # Try to find artist image near this link
         image_url = ""
-        # Check for <img> inside or adjacent to the link
         img_tag = link.find("img")
         if not img_tag:
-            # Check parent container for an image
             parent = link.parent
             if parent:
                 img_tag = parent.find("img")
         if img_tag:
             image_url = img_tag.get("src", "") or img_tag.get("data-src", "")
 
-        # Parse artist and venue from URL slug
         slug_match = re.search(r"/e/\d+-(.+)", href.split("?")[0])
         if slug_match:
             slug = slug_match.group(1)
-            # Slug format: artist-name-at-venue-name
             parts = slug.split("-at-", 1)
             artist = parts[0].replace("-", " ").title() if parts else "Unknown"
             venue = parts[1].replace("-", " ").title() if len(parts) > 1 else "TBA"
@@ -129,10 +142,9 @@ def fetch_events(city: str) -> list[dict]:
             artist = "Unknown"
             venue = "TBA"
 
-        # Try to extract date from link text
         date_str = ""
         date_match = re.search(
-            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}",
+            r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:,\s*\d{4})?",
             text,
         )
         if date_match:
@@ -146,7 +158,9 @@ def fetch_events(city: str) -> list[dict]:
                 "artist": artist,
                 "venue": venue,
                 "date": date_str,
+                "event_date": parse_event_date(date_str),
                 "city": city.split("-")[0].title(),
+                "genres": [genre],
                 "url": event_url,
                 "image": image_url,
             }
@@ -155,51 +169,88 @@ def fetch_events(city: str) -> list[dict]:
     return events
 
 
-# --- Deduplication ---
+# --- State ---
 
 
-def load_posted_events() -> set:
-    """Load previously posted event IDs from JSON file."""
+def load_event_state() -> dict:
+    """Load event state file and support legacy formats."""
     if not os.path.exists(POSTED_EVENTS_FILE):
-        return set()
-    with open(POSTED_EVENTS_FILE, "r") as f:
+        return {}
+
+    with open(POSTED_EVENTS_FILE, "r", encoding="utf-8") as f:
         data = json.load(f)
-    return set(data.get("posted_ids", []))
+
+    if isinstance(data, dict) and isinstance(data.get("events"), dict):
+        return data["events"]
+
+    posted_ids = data.get("posted_ids", []) if isinstance(data, dict) else []
+    migrated = {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for event_id in posted_ids:
+        migrated[str(event_id)] = {
+            "sent_initial": True,
+            "sent_reminder": False,
+            "event_date": "",
+            "last_seen": now_iso,
+        }
+    return migrated
 
 
-def save_posted_events(posted_ids: set):
-    """Save posted event IDs to JSON file."""
-    with open(POSTED_EVENTS_FILE, "w") as f:
-        json.dump({"posted_ids": sorted(posted_ids), "last_run": datetime.now(timezone.utc).isoformat()}, f, indent=2)
+def save_event_state(event_state: dict):
+    """Save event state with metadata."""
+    with open(POSTED_EVENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "events": event_state,
+                "last_run": datetime.now(timezone.utc).isoformat(),
+            },
+            f,
+            indent=2,
+        )
 
 
 # --- Discord ---
 
 
-def post_to_discord(events: list[dict]):
-    """Send new events to Discord as embeds (max 10 per message)."""
+def post_to_discord(events: list[dict], mode: str):
+    """Send events to Discord as rich embeds (max 10 per message)."""
     if not DISCORD_WEBHOOK:
         print("[ERROR] DISCORD_WEBHOOK not set")
         return
 
-    # Discord allows max 10 embeds per message
+    if mode == "reminder":
+        color = 0xFF8C00
+        heading = "Upcoming gig reminder"
+    else:
+        color = 0x8B0000
+        heading = "New gig announced"
+
     for i in range(0, len(events), 10):
         batch = events[i : i + 10]
         embeds = []
 
         for event in batch:
+            days_left = event.get("days_left")
+            when_text = event["date"] or "TBA"
+            if isinstance(days_left, int):
+                when_text = f"{when_text} ({days_left} days left)"
+
+            genre_text = ", ".join(g.title() for g in event.get("genres", [])) or "Unknown"
             embed = {
-                "title": f"🎸 {event['artist']}",
+                "title": event["artist"],
                 "url": event["url"],
-                "color": 0xFF0000,  # Red for metal \m/
+                "description": f"{heading} in {event['city']}",
+                "color": color,
                 "fields": [
-                    {"name": "📍 Venue", "value": event["venue"], "inline": True},
-                    {"name": "🏙️ City", "value": event["city"], "inline": True},
-                    {"name": "📅 Date", "value": event["date"] or "TBA", "inline": True},
+                    {"name": "Venue", "value": event["venue"], "inline": True},
+                    {"name": "City", "value": event["city"], "inline": True},
+                    {"name": "Date", "value": when_text, "inline": True},
+                    {"name": "Genre", "value": genre_text, "inline": False},
+                    {"name": "View", "value": f"[Open event page]({event['url']})", "inline": False},
                 ],
-                "footer": {"text": "via Bandsintown"},
+                "footer": {"text": "India Metal Gigs Bot | Bandsintown"},
+                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            # Add artist/band image as thumbnail if available
             if event.get("image"):
                 embed["thumbnail"] = {"url": event["image"]}
             embeds.append(embed)
@@ -211,10 +262,10 @@ def post_to_discord(events: list[dict]):
         }
 
         try:
-            resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=15)
+            resp = requests.post(DISCORD_WEBHOOK, json=payload, timeout=20)
             resp.raise_for_status()
-            print(f"[OK] Posted {len(batch)} events to Discord")
-        except Exception as e:
+            print(f"[OK] Posted {len(batch)} {mode} events to Discord")
+        except requests.RequestException as e:
             print(f"[ERROR] Discord webhook failed: {e}")
 
 
@@ -222,44 +273,86 @@ def post_to_discord(events: list[dict]):
 
 
 def main():
-    print(f"=== India Metal Gigs Bot — {datetime.now(timezone.utc).isoformat()} ===")
+    print(f"=== India Metal Gigs Bot | {datetime.now(timezone.utc).isoformat()} ===")
 
     if not SCRAPER_API_KEY:
         print("[ERROR] SCRAPER_API_KEY not set")
         return
 
-    # Load already-posted event IDs
-    posted_ids = load_posted_events()
-    print(f"Previously posted: {len(posted_ids)} events")
+    event_state = load_event_state()
+    print(f"State loaded: {len(event_state)} tracked events")
 
-    # Scrape all cities
     all_events = []
     for city in CITIES:
-        events = fetch_events(city)
-        print(f"  {city}: {len(events)} events found")
-        all_events.extend(events)
+        city_total = 0
+        for genre in GENRES:
+            events = fetch_events(city, genre)
+            city_total += len(events)
+            all_events.extend(events)
+            print(f"  {city}/{genre}: {len(events)} events found")
+        print(f"  {city} total: {city_total}")
 
-    # Deduplicate across city/genre combos (same event can appear multiple times)
     unique_events = {}
     for event in all_events:
-        if event["id"] not in unique_events:
-            unique_events[event["id"]] = event
+        event_id = event["id"]
+        if event_id not in unique_events:
+            unique_events[event_id] = event
+        else:
+            merged_genres = set(unique_events[event_id].get("genres", []))
+            merged_genres.update(event.get("genres", []))
+            unique_events[event_id]["genres"] = sorted(merged_genres)
 
     print(f"Total unique events: {len(unique_events)}")
 
-    # Filter out already-posted
-    new_events = [e for e in unique_events.values() if e["id"] not in posted_ids]
+    today = datetime.now(timezone.utc).date()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    new_events = []
+    reminder_events = []
+
+    for event in unique_events.values():
+        event_id = event["id"]
+        state = event_state.get(event_id, {})
+        state.setdefault("sent_initial", False)
+        state.setdefault("sent_reminder", False)
+        state.setdefault("event_date", event.get("event_date", ""))
+        state["last_seen"] = now_iso
+
+        if event.get("event_date"):
+            state["event_date"] = event["event_date"]
+
+        if not state["sent_initial"]:
+            new_events.append(event)
+
+        if state["sent_initial"] and not state["sent_reminder"] and state.get("event_date"):
+            try:
+                event_day = datetime.strptime(state["event_date"], "%Y-%m-%d").date()
+                days_left = (event_day - today).days
+                if 0 <= days_left <= 7:
+                    reminder_event = dict(event)
+                    reminder_event["days_left"] = days_left
+                    reminder_events.append(reminder_event)
+            except ValueError:
+                pass
+
+        event_state[event_id] = state
+
     print(f"New events to post: {len(new_events)}")
+    print(f"Reminder events to post: {len(reminder_events)}")
 
     if new_events:
-        post_to_discord(new_events)
-
-        # Update posted IDs
+        post_to_discord(new_events, mode="new")
         for event in new_events:
-            posted_ids.add(event["id"])
-        save_posted_events(posted_ids)
-    else:
-        print("No new events. Done.")
+            event_state[event["id"]]["sent_initial"] = True
+
+    if reminder_events:
+        post_to_discord(reminder_events, mode="reminder")
+        for event in reminder_events:
+            event_state[event["id"]]["sent_reminder"] = True
+
+    save_event_state(event_state)
+
+    if not new_events and not reminder_events:
+        print("No new or reminder events. Done.")
 
 
 if __name__ == "__main__":
